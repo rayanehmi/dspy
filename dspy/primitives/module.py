@@ -1,6 +1,7 @@
 import inspect
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -212,7 +213,7 @@ class Module(BaseModule, metaclass=ProgramMeta):
             raise ValueError("`examples` must contain at least one item.")
 
         predictor = self._get_single_predictor_for_batch()
-        adapter = settings.adapter or ChatAdapter()
+        adapter = _resolve_adapter_instance(settings.adapter)
         normalized_examples = _normalize_examples(examples)
         writer = _BatchRequestWriter(
             module=self,
@@ -282,6 +283,17 @@ class Module(BaseModule, metaclass=ProgramMeta):
         **batch_kwargs,
     ) -> "DSPyBatchHandle":
         provider_name = custom_llm_provider or artifacts.provider_name
+        batch_kwargs = dict(batch_kwargs)
+        if _is_groq_provider(provider_name):
+            groq_api_key = batch_kwargs.pop("groq_api_key", None)
+            return await self._groq_submit_batch_file(
+                artifacts,
+                completion_window=completion_window,
+                provider_name=provider_name,
+                file_kwargs=file_kwargs,
+                batch_kwargs=batch_kwargs,
+                groq_api_key=groq_api_key,
+            )
         file_payload = {"purpose": "batch"}
         if file_kwargs:
             file_payload.update(file_kwargs)
@@ -309,6 +321,49 @@ class Module(BaseModule, metaclass=ProgramMeta):
             "completion_window": completion_window or "24h",
             "endpoint": artifacts.endpoint,
             "custom_llm_provider": provider_name,
+        }
+        artifacts.metadata_file.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        artifacts.metadata = metadata
+
+        return DSPyBatchHandle(
+            batch=batch_response,
+            batch_id=getattr(batch_response, "id", None),
+            input_file_id=getattr(file_obj, "id", None),
+            request_file=artifacts.request_file,
+            metadata_file=artifacts.metadata_file,
+            artifacts=artifacts,
+        )
+
+    async def _groq_submit_batch_file(
+        self,
+        artifacts: "BatchRequestArtifacts",
+        *,
+        completion_window: str = "24h",
+        provider_name: str | None = None,
+        file_kwargs: dict[str, Any] | None = None,
+        batch_kwargs: dict[str, Any] | None = None,
+        groq_api_key: str | None = None,
+    ) -> "DSPyBatchHandle":
+        adapter = _GroqBatchAdapter(api_key=_resolve_groq_api_key(self, groq_api_key))
+        file_obj = await adapter.upload_file(artifacts.request_file, file_kwargs=file_kwargs)
+
+        batch_payload = {
+            "completion_window": completion_window or "24h",
+            "endpoint": artifacts.endpoint,
+            "input_file_id": getattr(file_obj, "id", None),
+        }
+        if batch_kwargs:
+            batch_payload.update(batch_kwargs)
+
+        batch_response = await adapter.create_batch(**batch_payload)
+
+        metadata = artifacts.load_metadata()
+        metadata["groq"] = {
+            "input_file_id": getattr(file_obj, "id", None),
+            "batch_id": getattr(batch_response, "id", None),
+            "completion_window": completion_window or "24h",
+            "endpoint": artifacts.endpoint,
+            "provider": provider_name or "groq",
         }
         artifacts.metadata_file.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
         artifacts.metadata = metadata
@@ -353,6 +408,16 @@ class Module(BaseModule, metaclass=ProgramMeta):
             lm = getattr(predictor, "lm", None) if predictor else None
             provider_name = _infer_provider_name(getattr(lm, "model", None))
 
+        litellm_kwargs = dict(litellm_kwargs)
+        if _is_groq_provider(provider_name):
+            groq_api_key = litellm_kwargs.pop("groq_api_key", None)
+            return await self._groq_retrieve_batch(
+                batch_id=batch_id,
+                download_output_path=download_output_path,
+                request_kwargs=litellm_kwargs,
+                groq_api_key=groq_api_key,
+            )
+
         batch_response = await litellm.aretrieve_batch(
             batch_id=batch_id,
             custom_llm_provider=provider_name,
@@ -367,6 +432,33 @@ class Module(BaseModule, metaclass=ProgramMeta):
                     destination=download_output_path,
                     provider_name=provider_name,
                 )
+                setattr(batch_response, "_dspy_local_output_path", str(saved_path))
+            else:
+                logger.warning(
+                    "Batch %s does not have an `output_file_id` yet. Skipping download to %s.",
+                    batch_id,
+                    download_output_path,
+                )
+
+        return batch_response
+
+    async def _groq_retrieve_batch(
+        self,
+        batch_id: str,
+        *,
+        download_output_path: str | Path | None = None,
+        request_kwargs: dict[str, Any] | None = None,
+        groq_api_key: str | None = None,
+    ):
+        adapter = _GroqBatchAdapter(api_key=_resolve_groq_api_key(self, groq_api_key))
+        request_kwargs = request_kwargs or {}
+        batch_response = await adapter.retrieve_batch(batch_id, **request_kwargs)
+
+        if download_output_path:
+            output_file_id = getattr(batch_response, "output_file_id", None)
+            if output_file_id:
+                destination = Path(download_output_path)
+                saved_path = await adapter.download_file(output_file_id, destination)
                 setattr(batch_response, "_dspy_local_output_path", str(saved_path))
             else:
                 logger.warning(
@@ -401,7 +493,7 @@ class Module(BaseModule, metaclass=ProgramMeta):
         local_output = getattr(batch_response, "_dspy_local_output_path", None) or output_path
         metadata = artifacts.load_metadata()
         predictor = self._get_single_predictor_for_batch()
-        adapter = settings.adapter or ChatAdapter()
+        adapter = _resolve_adapter_instance(settings.adapter)
         predictions = _parse_batch_output_file(
             module=self,
             predictor=predictor,
@@ -424,6 +516,7 @@ class Module(BaseModule, metaclass=ProgramMeta):
         **batch_kwargs,
     ):
         """Convenience wrapper that creates the batch, sends it and waits for completion in a non-blocking way."""
+        batch_kwargs = dict(batch_kwargs)
         batch_handle = await self.acreate_batch(
             examples,
             completion_window=completion_window,
@@ -434,8 +527,19 @@ class Module(BaseModule, metaclass=ProgramMeta):
             **batch_kwargs,
         )
 
+        provider_hint = custom_llm_provider or getattr(getattr(batch_handle, "artifacts", None), "provider_name", None)
+        resolved_provider = custom_llm_provider or provider_hint
+        groq_api_key = batch_kwargs.get("groq_api_key") if _is_groq_provider(resolved_provider) else None
+        retrieve_kwargs: dict[str, Any] = {}
+        if groq_api_key:
+            retrieve_kwargs["groq_api_key"] = groq_api_key
+
         while True:
-            info = await self.aretrieve_batch(batch_handle.batch_id)
+            info = await self.aretrieve_batch(
+                batch_handle.batch_id,
+                custom_llm_provider=resolved_provider,
+                **retrieve_kwargs,
+            )
             if getattr(info, "status", None) == "completed" and getattr(info, "output_file_id", None):
                 break
             await asyncio.sleep(sleep_delay)
@@ -444,6 +548,8 @@ class Module(BaseModule, metaclass=ProgramMeta):
             batch_handle.batch_id,
             batch_handle,
             download_output_path=None,
+            custom_llm_provider=resolved_provider,
+            **retrieve_kwargs,
         )
         return predictions
 
@@ -596,7 +702,12 @@ class _BatchRequestWriter:
             self.endpoint = self._endpoint_override or _default_endpoint_for_model(lm)
         self._lm_model_type = getattr(lm, "model_type", "chat")
 
-        processed_signature = self.adapter._call_preprocess(lm, config, signature, kwargs)
+        processed_signature = self.adapter._call_preprocess(
+            lm=lm,
+            lm_kwargs=config,
+            signature=signature,
+            inputs=kwargs,
+        )
         messages = self.adapter.format(processed_signature, demos, kwargs)
         sanitized_kwargs = _sanitize_lm_kwargs(config)
         body = {
@@ -871,3 +982,99 @@ def _ensure_binary_content(content: Any) -> bytes:
     if isinstance(content, list):
         return "\n".join(str(item) for item in content).encode("utf-8")
     return json.dumps(content, ensure_ascii=False, default=str).encode("utf-8")
+
+def _resolve_adapter_instance(adapter):
+    if adapter is None:
+        return ChatAdapter()
+    if isinstance(adapter, type):
+        return adapter()
+    return adapter
+
+
+def _is_groq_provider(provider_name: str | None) -> bool:
+    return isinstance(provider_name, str) and provider_name.lower() == "groq"
+
+
+def _resolve_groq_api_key(module: Module, provided_key: str | None = None) -> str:
+    if provided_key:
+        return provided_key
+
+    predictor = None
+    try:
+        predictor = module._get_single_predictor_for_batch()
+    except NotImplementedError:
+        predictor = None
+
+    lm = getattr(predictor, "lm", None) if predictor else None
+    lm_kwargs = getattr(lm, "kwargs", {}) if lm else {}
+    api_key = lm_kwargs.get("api_key")
+    if api_key:
+        return api_key
+
+    default_lm = getattr(settings, "lm", None)
+    default_kwargs = getattr(default_lm, "kwargs", {}) if default_lm else {}
+    api_key = default_kwargs.get("api_key")
+    if api_key:
+        return api_key
+
+    api_key = os.getenv("GROQ_API_KEY")
+    if api_key:
+        return api_key
+
+    raise ValueError(
+        "Unable to resolve Groq API key. Pass `groq_api_key=...`, configure your LM with `api_key`, "
+        "or set the GROQ_API_KEY environment variable."
+    )
+
+
+def _get_groq_client(api_key: str):
+    try:
+        from groq import Groq
+    except ImportError as exc:
+        raise ImportError(
+            "The `groq` package is required for Groq batch helpers. Install it via `pip install groq`."
+        ) from exc
+
+    if not api_key:
+        raise ValueError("Groq API key is required but was not provided.")
+
+    return Groq(api_key=api_key)
+
+
+class _GroqBatchAdapter:
+    def __init__(self, api_key: str):
+        self._client = _get_groq_client(api_key)
+
+    async def upload_file(self, request_file: Path, file_kwargs: dict[str, Any] | None = None):
+        file_payload = {"purpose": "batch"}
+        if file_kwargs:
+            file_payload.update(file_kwargs)
+
+        def _create():
+            with open(request_file, "rb") as buffer:
+                return self._client.files.create(file=buffer, **file_payload)
+
+        return await asyncio.to_thread(_create)
+
+    async def create_batch(self, **payload):
+        def _create():
+            return self._client.batches.create(**payload)
+
+        return await asyncio.to_thread(_create)
+
+    async def retrieve_batch(self, batch_id: str, **kwargs):
+        def _retrieve():
+            return self._client.batches.retrieve(batch_id=batch_id, **kwargs)
+
+        return await asyncio.to_thread(_retrieve)
+
+    async def download_file(self, file_id: str, destination: Path):
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+
+        def _download():
+            response = self._client.files.content(file_id=file_id)
+            response.write_to_file(str(destination))
+            return destination
+
+        return await asyncio.to_thread(_download)
