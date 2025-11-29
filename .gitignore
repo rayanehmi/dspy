@@ -67,3 +67,6 @@ docs/docs/**/*.json*
 
 test_before_pypi/
 .github/.internal_dspyai/dist/
+.python-version
+/.dspy_batches
+/batches
