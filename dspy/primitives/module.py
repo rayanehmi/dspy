@@ -483,10 +483,11 @@ class Module(BaseModule, metaclass=ProgramMeta):
         into DSPy ``Prediction`` objects aligned with the original examples.
         """
         artifacts = _resolve_artifacts(artifacts_or_handle)
+        provider_name = custom_llm_provider or getattr(artifacts, "provider_name", None)
         output_path = download_output_path or artifacts.metadata_file.with_suffix(".output.jsonl")
         batch_response = await self.aretrieve_batch(
             batch_id=batch_id,
-            custom_llm_provider=custom_llm_provider,
+            custom_llm_provider=provider_name,
             download_output_path=output_path,
             **litellm_kwargs,
         )
