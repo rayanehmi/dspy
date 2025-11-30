@@ -520,8 +520,9 @@ class Module(BaseModule, metaclass=ProgramMeta):
         input_file_path: str | Path | None = None,
         custom_id_prefix: str | None = None,
         custom_llm_provider: str | None = None,
+        return_failed_items: bool = False,
         **batch_kwargs,
-    ):
+    ) -> list[Prediction] | tuple[list[Prediction | None], list["BatchPredictionFailure"]]:
         """Convenience wrapper that creates the batch, sends it and waits for completion in a non-blocking way."""
         batch_kwargs = dict(batch_kwargs)
         batch_handle = await self.acreate_batch(
@@ -551,14 +552,18 @@ class Module(BaseModule, metaclass=ProgramMeta):
                 break
             await asyncio.sleep(sleep_delay)
 
-        predictions = await self.aretrieve_batch_predictions(
+        predictions_result = await self.aretrieve_batch_predictions(
             batch_handle.batch_id,
             batch_handle,
             download_output_path=None,
             custom_llm_provider=resolved_provider,
+            return_failed_items=return_failed_items,
             **retrieve_kwargs,
         )
-        return predictions
+        if return_failed_items:
+            return predictions_result  # type: ignore[return-value]
+
+        return predictions_result  # type: ignore[return-value]
 
 
 
