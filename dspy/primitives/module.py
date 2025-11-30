@@ -12,6 +12,7 @@ import asyncio
 
 import litellm
 from dspy.adapters.chat_adapter import ChatAdapter
+from dspy.adapters.json_adapter import JSONAdapter
 from dspy.dsp.utils.settings import settings
 from dspy.predict.parallel import Parallel
 from dspy.primitives.base_module import BaseModule
@@ -19,6 +20,7 @@ from dspy.primitives.example import Example
 from dspy.primitives.prediction import Prediction
 from dspy.utils import magicattr
 from dspy.utils.callback import with_callbacks
+from dspy.utils.exceptions import AdapterParseError
 from dspy.utils.inspect_history import pretty_print_history
 from dspy.utils.saving import get_dependency_versions
 from dspy.utils.usage_tracker import track_usage
@@ -476,8 +478,9 @@ class Module(BaseModule, metaclass=ProgramMeta):
         *,
         custom_llm_provider: str | None = None,
         download_output_path: str | Path | None = None,
+        return_failed_items: bool = False,
         **litellm_kwargs,
-    ) -> list[Prediction]:
+    ) -> list[Prediction] | tuple[list[Prediction | None], list["BatchPredictionFailure"]]:
         """
         Retrieve the batch, download its output file (if necessary), and parse it back
         into DSPy ``Prediction`` objects aligned with the original examples.
@@ -495,14 +498,17 @@ class Module(BaseModule, metaclass=ProgramMeta):
         metadata = artifacts.load_metadata()
         predictor = self._get_single_predictor_for_batch()
         adapter = _resolve_adapter_instance(settings.adapter)
-        predictions = _parse_batch_output_file(
+        predictions, failures = _parse_batch_output_file(
             module=self,
             predictor=predictor,
             adapter=adapter,
             metadata=metadata,
             output_path=Path(local_output),
+            return_failed_items=return_failed_items,
         )
-        return predictions
+        if return_failed_items:
+            return predictions, failures
+        return predictions  # type: ignore[return-value]
     
     async def abatch(
         self,
@@ -641,6 +647,15 @@ class BatchRequestArtifacts:
             model_name=model,
             endpoint=endpoint,
         )
+
+
+@dataclass
+class BatchPredictionFailure:
+    custom_id: str
+    index: int
+    error: str
+    raw_record: dict[str, Any] | None = None
+    output_path: str | None = None
 
 
 class _BatchRequestWriter:
@@ -860,12 +875,16 @@ def _parse_batch_output_file(
     adapter,
     metadata: dict[str, Any],
     output_path: Path,
-) -> list[Prediction]:
+    *,
+    return_failed_items: bool = False,
+) -> tuple[list[Prediction | None], list["BatchPredictionFailure"]]:
     if not output_path.exists():
         raise FileNotFoundError(f"Batch output file not found: {output_path}")
 
     entries = {entry["custom_id"]: entry for entry in metadata.get("examples", [])}
+    entries_by_index = {entry["index"]: entry for entry in metadata.get("examples", [])}
     predictions: list[Prediction | None] = [None] * len(entries)
+    failures: list[BatchPredictionFailure] = []
 
     with open(output_path, "r", encoding="utf-8") as output_file:
         for line in output_file:
@@ -879,30 +898,88 @@ def _parse_batch_output_file(
 
             entry = entries[custom_id]
             if record.get("error"):
+                failure = BatchPredictionFailure(
+                    custom_id=custom_id,
+                    index=entry["index"],
+                    error=json.dumps(record["error"], ensure_ascii=False),
+                    raw_record=record,
+                    output_path=str(output_path),
+                )
+                if return_failed_items:
+                    failures.append(failure)
+                    continue
                 raise RuntimeError(f"Batch item {custom_id} failed: {record['error']}")
 
             body = _extract_response_body(record)
             completions = _build_completions_from_body(body)
-            parsed_outputs = adapter._call_postprocess(
-                predictor.signature,
-                predictor.signature,
-                completions,
-                predictor.lm,
-                {},
+            try:
+                parsed_outputs = adapter._call_postprocess(
+                    predictor.signature,
+                    predictor.signature,
+                    completions,
+                    predictor.lm,
+                    {},
+                )
+                prediction = Prediction.from_completions(parsed_outputs, signature=predictor.signature)
+                usage = body.get("usage")
+                if usage:
+                    module._set_lm_usage(usage, prediction)
+                predictions[entry["index"]] = prediction
+            except AdapterParseError as exc:
+                fallback_prediction = _attempt_json_adapter_postprocess(
+                    predictor=predictor,
+                    completions=completions,
+                )
+                if fallback_prediction is not None:
+                    usage = body.get("usage")
+                    if usage:
+                        module._set_lm_usage(usage, fallback_prediction)
+                    predictions[entry["index"]] = fallback_prediction
+                    continue
+                failure = BatchPredictionFailure(
+                    custom_id=custom_id,
+                    index=entry["index"],
+                    error=str(exc),
+                    raw_record=record,
+                    output_path=str(output_path),
+                )
+                if return_failed_items:
+                    failures.append(failure)
+                    continue
+                raise
+            except Exception as exc:
+                failure = BatchPredictionFailure(
+                    custom_id=custom_id,
+                    index=entry["index"],
+                    error=str(exc),
+                    raw_record=record,
+                    output_path=str(output_path),
+                )
+                if return_failed_items:
+                    failures.append(failure)
+                    continue
+                raise
+
+    missing = [idx for idx, pred in enumerate(predictions) if pred is None]
+    if missing:
+        if return_failed_items:
+            for idx in missing:
+                entry = entries_by_index.get(idx, {"custom_id": f"<unknown-{idx}>", "index": idx})
+                failures.append(
+                    BatchPredictionFailure(
+                        custom_id=entry["custom_id"],
+                        index=idx,
+                        error="Missing response in batch output.",
+                        raw_record=None,
+                        output_path=str(output_path),
+                    )
+                )
+        else:
+            raise RuntimeError(
+                "Output file did not contain responses for every request. "
+                "Wait for completion or verify the batch output file."
             )
-            prediction = Prediction.from_completions(parsed_outputs, signature=predictor.signature)
-            usage = body.get("usage")
-            if usage:
-                module._set_lm_usage(usage, prediction)
-
-            predictions[entry["index"]] = prediction
-
-    if any(pred is None for pred in predictions):
-        raise RuntimeError(
-            "Output file did not contain responses for every request. "
-            "Wait for completion or verify the batch output file."
-        )
-    return predictions  # type: ignore[return-value]
+    return predictions, failures  # type: ignore[return-value]
 
 
 def _extract_response_body(record: dict[str, Any]) -> dict[str, Any]:
@@ -983,6 +1060,24 @@ def _ensure_binary_content(content: Any) -> bytes:
     if isinstance(content, list):
         return "\n".join(str(item) for item in content).encode("utf-8")
     return json.dumps(content, ensure_ascii=False, default=str).encode("utf-8")
+
+
+def _attempt_json_adapter_postprocess(
+    predictor,
+    completions: list[dict[str, Any]],
+) -> Prediction | None:
+    try:
+        fallback_adapter = JSONAdapter()
+        parsed_outputs = fallback_adapter._call_postprocess(
+            predictor.signature,
+            predictor.signature,
+            completions,
+            predictor.lm,
+            {},
+        )
+        return Prediction.from_completions(parsed_outputs, signature=predictor.signature)
+    except Exception:
+        return None
 
 def _resolve_adapter_instance(adapter):
     if adapter is None:
